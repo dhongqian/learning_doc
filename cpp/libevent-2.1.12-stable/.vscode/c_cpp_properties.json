@@ -1,0 +1,19 @@
+{
+    "configurations": [{
+        "name": "Win32",
+        "includePath": [
+            "${workspaceFolder}/**",
+            "C:\\Program Files (x86)\\Microsoft SDKs\\Windows\\v7.0A\\Include\\**",
+            "C:\\Program Files (x86)\\Microsoft Visual Studio 10.0\\VC\\include\\*"
+
+        ],
+        "defines": [
+            "WIN32",
+            "_DEBUG",
+            "UNICODE",
+            "_UNICODE"
+        ],
+        "intelliSenseMode": "msvc-x64"
+    }],
+    "version": 4
+}
