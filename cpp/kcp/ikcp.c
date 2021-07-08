@@ -356,6 +356,8 @@ void ikcp_setoutput(ikcpcb *kcp, int (*output)(const char *buf, int len,
 //---------------------------------------------------------------------
 /**
  * kcp将接收到的kcp数据包还原成之前kcp发送的buffer数据
+ * 将kcp收到的kcp格式的包，解码成应用层可识别的数据，并回调给应用层，
+ * 表示应用层从远端收到的数据
  */
 int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 {
@@ -371,6 +373,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 
 	if (len < 0) len = -len;
 
+    // 获取收到对端发送的一个完整包大小
 	peeksize = ikcp_peeksize(kcp);
 
 	if (peeksize < 0) 
@@ -401,6 +404,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 			ikcp_log(kcp, IKCP_LOG_RECV, "recv sn=%lu", seg->sn);
 		}
 
+        /// segment数据已接收完，从接收队列中删除， nrcv_que数量-1
 		if (ispeek == 0) {
 			iqueue_del(&seg->node);
 			ikcp_segment_delete(kcp, seg);
@@ -408,19 +412,30 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 		}
 
 		/// 在发送的时候，有可能分片，在接收时，确保收到的，是一个完整的数据包
+		// 在发送端，分片序列号fragment是从大到小发送的，最后一个分片的序列号是0，
+		// 所以当fragment == 0时，表示一个完整的数据包接收完成
+		// 未分片的数据包的fragment为0
 		if (fragment == 0) 
 			break;
 	}
 
+	/// len是实际拷贝到buffer中的数据大小
+	/// peeksize是完整包的大小
+	/// 上述for拷贝了一个完整的包，len、peeksize应该相等
 	assert(len == peeksize);
 
 	// move available data from rcv_buf -> rcv_queue
+	/// kcp接收到数据后，先放在rvc_buf中，然后在下面的while循环中，将rcv_buf中的数据，再
+	/// 移动到rcv_que中
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
 		IKCPSEG *seg = iqueue_entry(kcp->rcv_buf.next, IKCPSEG, node);
 		if (seg->sn == kcp->rcv_nxt && kcp->nrcv_que < kcp->rcv_wnd) {
+			/// rcv_buf中删除segment, rcv_que中添加一个segment
 			iqueue_del(&seg->node);
+			/// rcv_buf的数量-1
 			kcp->nrcv_buf--;
 			iqueue_add_tail(&seg->node, &kcp->rcv_queue);
+			/// rcv_que的数量+1, 等接收的序列号sn+1
 			kcp->nrcv_que++;
 			kcp->rcv_nxt++;
 		}	else {
@@ -429,6 +444,7 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 	}
 
 	// fast recover
+	/// 接收窗口不足了，通知发送端，调整发送速度
 	if (kcp->nrcv_que < kcp->rcv_wnd && recover) {
 		// ready to send back IKCP_CMD_WINS in ikcp_flush
 		// tell remote my window size
@@ -441,6 +457,8 @@ int ikcp_recv(ikcpcb *kcp, char *buffer, int len)
 
 //---------------------------------------------------------------------
 // peek data size
+// 如果没有分包，直接返回segment size
+// 如果有分包，等所有分包都收到后，计算分包大小的和
 //---------------------------------------------------------------------
 int ikcp_peeksize(const ikcpcb *kcp)
 {
@@ -486,6 +504,7 @@ int ikcp_send(ikcpcb *kcp, const char *buffer, int len)
 
 	// append to previous segment in streaming mode (if possible)
 	// 先将发送队列中，最后一个还没有达到MSS大小的包，补充至MSS大小
+	// 如果snd_que中最后一个包过小，和新的数据合成一个segment
 	if (kcp->stream != 0) {
 		if (!iqueue_is_empty(&kcp->snd_queue)) {
 			/// 取最后一个segment
@@ -580,6 +599,7 @@ static void ikcp_update_ack(ikcpcb *kcp, IINT32 rtt)
 	kcp->rx_rto = _ibound_(kcp->rx_minrto, rto, IKCP_RTO_MAX);
 }
 
+/// 更新snd_una
 static void ikcp_shrink_buf(ikcpcb *kcp)
 {
 	struct IQUEUEHEAD *p = kcp->snd_buf.next;
@@ -591,13 +611,16 @@ static void ikcp_shrink_buf(ikcpcb *kcp)
 	}
 }
 
+/// sn数据已经收到，需要从snd_buf中删除
 static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 {
 	struct IQUEUEHEAD *p, *next;
 
+	/// 重复接收sn || 接收到的sn大于还未发送的sn，说明是无效sn，直接返回
 	if (_itimediff(sn, kcp->snd_una) < 0 || _itimediff(sn, kcp->snd_nxt) >= 0)
 		return;
 
+	/// sn是接收端发过来的确认，表示sn数据已经收到，因此sn的数据要从snd_buf中删除
 	for (p = kcp->snd_buf.next; p != &kcp->snd_buf; p = next) {
 		IKCPSEG *seg = iqueue_entry(p, IKCPSEG, node);
 		next = p->next;
@@ -608,12 +631,14 @@ static void ikcp_parse_ack(ikcpcb *kcp, IUINT32 sn)
 			kcp->nsnd_buf--;
 			break;
 		}
+		/// snd_buf中的序列号比sn大，不能删除，而且后续的序列号肯定比sn大，所以直接退出，不再再比较了
 		if (_itimediff(sn, seg->sn) < 0) {
 			break;
 		}
 	}
 }
 
+/// una之前的包都已收到，因此una之前的包可以从snd_buf中删除
 static void ikcp_parse_una(ikcpcb *kcp, IUINT32 una)
 {
 	struct IQUEUEHEAD *p, *next;
@@ -707,6 +732,7 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 	IUINT32 sn = newseg->sn;
 	int repeat = 0;
 	
+	// 超过接收窗口数 或 重复接收的数据，直接返回
 	if (_itimediff(sn, kcp->rcv_nxt + kcp->rcv_wnd) >= 0 ||
 		_itimediff(sn, kcp->rcv_nxt) < 0) {
 		ikcp_segment_delete(kcp, newseg);
@@ -720,11 +746,14 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 			repeat = 1;
 			break;
 		}
+		/// 比接收buf中的sn大，说明snd_buf中没有这个sn对应的数据，退出循环
 		if (_itimediff(sn, seg->sn) > 0) {
 			break;
 		}
 	}
 
+	/// 不是重复的，说明收到了新的数据，加入rcv_buf中
+	/// 如果是重复的，直接删除
 	if (repeat == 0) {
 		iqueue_init(&newseg->node);
 		iqueue_add(&newseg->node, p);
@@ -741,6 +770,7 @@ void ikcp_parse_data(ikcpcb *kcp, IKCPSEG *newseg)
 	// move available data from rcv_buf -> rcv_queue
 	while (! iqueue_is_empty(&kcp->rcv_buf)) {
 		IKCPSEG *seg = iqueue_entry(kcp->rcv_buf.next, IKCPSEG, node);
+		/// 如果收到了下一个数据，且没有超过接收窗口大小，将数据从rcv_buf移至rcv_que中
 		if (seg->sn == kcp->rcv_nxt && kcp->nrcv_que < kcp->rcv_wnd) {
 			iqueue_del(&seg->node);
 			kcp->nrcv_buf--;
@@ -877,6 +907,10 @@ int ikcp_input(ikcpcb *kcp, const char *data, long size)
 
 					ikcp_parse_data(kcp, seg);
 				}
+			}
+			else /// 接收窗口没有空间，空操作
+			{
+
 			}
 		}
 		else if (cmd == IKCP_CMD_WASK) {
